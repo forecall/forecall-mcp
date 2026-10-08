@@ -1,0 +1,59 @@
+# Lint, typecheck and test on pull requests to main and on pushes to it, then pack the package and
+# try it as users install it, on the oldest and the newest Node it supports. The job name "check"
+# is the required status check of main's ruleset. Actions are pinned to commit SHAs; the comment
+# shows the release.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Versions come from mise.toml.
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          install_args: node pnpm
+
+      - name: Locate the pnpm store
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm check
+
+      - name: Pack
+        id: pack
+        run: echo "tarball=$(node pack.ts "$RUNNER_TEMP/package")" >> "$GITHUB_OUTPUT"
+
+      - name: Try the package on Node 22 and 24
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          mise install node@22
+          scripts/try-package.sh "$TARBALL"
+          mise exec node@22 -- scripts/try-package.sh "$TARBALL"

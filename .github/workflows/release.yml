@@ -1,0 +1,155 @@
+# Publishes `forecall-mcp` to npm.
+# - A push to main that raises the version (or changes this workflow) stages it when npm does not
+#   have it yet. A maintainer can also run it by hand on main (workflow_dispatch).
+# - It only stages the version (npm's staged publishing): the version goes live when a maintainer
+#   approves it with 2FA on npmjs.com or with `npm stage approve`. The Trusted Publisher allows
+#   `npm stage publish` only, so a stolen workflow run can at most leave a tarball awaiting
+#   approval.
+# - npm attaches provenance: anyone can check which commit and workflow built the tarball.
+# The package is built and tried in `build`, which has no OIDC token, and published in `publish`,
+# which runs no dependency code: only that job can mint the token npm's Trusted Publishing takes.
+# Actions are pinned to commit SHAs; the comment shows the release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      new: ${{ steps.version.outputs.new }}
+      version: ${{ steps.version.outputs.version }}
+      file: ${{ steps.pack.outputs.file }}
+    steps:
+      - name: Only from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Run this workflow on main"
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          install_args: node pnpm
+
+      # npm answers E404 for a version it does not have; any other error fails the job.
+      - name: Find whether npm has the version
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if out=$(npm view "forecall-mcp@$version" version 2>&1); then
+            echo "forecall-mcp@$version is on npm"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          elif grep -q E404 <<<"$out"; then
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$out"
+            exit 1
+          fi
+
+      # No dependency cache in a release build, so a poisoned cache cannot reach the package.
+      - if: steps.version.outputs.new == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - if: steps.version.outputs.new == 'true'
+        run: pnpm check
+
+      - name: Pack
+        id: pack
+        if: steps.version.outputs.new == 'true'
+        run: |
+          tarball=$(node pack.ts "$RUNNER_TEMP/package")
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "file=$(basename "$tarball")" >> "$GITHUB_OUTPUT"
+
+      # Installs the tarball as users do and runs it on the oldest and the newest Node it supports.
+      - name: Try the package on Node 22 and 24
+        if: steps.version.outputs.new == 'true'
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          mise install node@22
+          scripts/try-package.sh "$TARBALL"
+          mise exec node@22 -- scripts/try-package.sh "$TARBALL"
+
+      - if: steps.version.outputs.new == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package
+          path: ${{ steps.pack.outputs.tarball }}
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: build
+    if: needs.build.outputs.new == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Only main may use this environment. npm's Trusted Publisher names this workflow and
+    # environment. Its one optional secret, SLACK_WEBHOOK_URL, says a version awaits approval.
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/forecall-mcp
+    permissions:
+      contents: write # the tag forecall-mcp@<version>
+      id-token: write # npm's Trusted Publishing and the provenance (GitHub Actions OIDC)
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      FILE: ${{ needs.build.outputs.file }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Trusted Publishing needs npm 11.5.1 or later and staged publishing 11.15.0 or later;
+      # Node 24.21.0 (mise.toml) ships 11.19.0.
+      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+        with:
+          install_args: node
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
+
+      # No token: npm exchanges the job's OIDC token. The version waits in npm's staging area until
+      # a maintainer approves it with 2FA.
+      - name: Stage
+        run: npm stage publish "$RUNNER_TEMP/package/$FILE" --access public --provenance
+
+      # The tag marks the commit the staged tarball came from. If the version is rejected instead
+      # of approved, delete the tag: git push origin ":refs/tags/forecall-mcp@<version>".
+      - name: Tag the staged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/forecall-mcp@$VERSION" -f "sha=$GITHUB_SHA"
+
+      # Optional, and never fails the job: the version is staged either way.
+      - name: Tell Slack the version awaits approval
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          body=$(node -e '
+            const text = `npm の承認待ち: forecall-mcp@${process.env.VERSION}（npmjs.com の Staged Packages か npm stage approve で承認する。2FA）\nhttps://www.npmjs.com/package/forecall-mcp`;
+            console.log(JSON.stringify({ text }));
+          ')
+          curl -fsS -X POST -H "Content-Type: application/json" --data "$body" "$SLACK_WEBHOOK_URL" > /dev/null || echo "::warning::Slack did not take the message"

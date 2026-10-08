@@ -1,0 +1,8 @@
+engineStrict: true
+saveExact: true
+# Do not resolve versions published less than a day ago.
+minimumReleaseAge: 1440
+# Dependency build scripts, which pnpm blocks until reviewed. esbuild only checks its binary in
+# postinstall and finds it through its platform package anyway, so it is not run.
+allowBuilds:
+  esbuild: false
